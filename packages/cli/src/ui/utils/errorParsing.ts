@@ -60,6 +60,38 @@ export function parseAndFormatApiError(
   error: unknown,
   authType?: AuthType,
 ): string {
+  // Detect Google account age verification errors
+  const ageVerificationPatterns = [
+    /age verification/i,
+    /not eligible/i,
+    /account.*age.*require/i,
+    /age.*require.*google/i,
+    /age.*restriction/i,
+    /age.*verify/i,
+    /must be.*years old/i,
+    /parental consent/i,
+  ];
+  const AGE_VERIFICATION_MESSAGE =
+    'You must pass age verification for your Google account. See https://support.google.com/accounts/answer/13504020';
+
+  // Check string errors for age verification
+  if (typeof error === 'string') {
+    for (const pattern of ageVerificationPatterns) {
+      if (pattern.test(error)) {
+        return AGE_VERIFICATION_MESSAGE;
+      }
+    }
+  }
+
+  // Check structured errors for age verification
+  if (isStructuredError(error) && typeof error.message === 'string') {
+    for (const pattern of ageVerificationPatterns) {
+      if (pattern.test(error.message)) {
+        return AGE_VERIFICATION_MESSAGE;
+      }
+    }
+  }
+
   if (isStructuredError(error)) {
     let text = `[API Error: ${error.message}]`;
     if (error.status === 429) {
@@ -81,6 +113,12 @@ export function parseAndFormatApiError(
       const parsedError = JSON.parse(jsonString) as unknown;
       if (isApiError(parsedError)) {
         let finalMessage = parsedError.error.message;
+        // Check for age verification in parsed error message
+        for (const pattern of ageVerificationPatterns) {
+          if (pattern.test(finalMessage)) {
+            return AGE_VERIFICATION_MESSAGE;
+          }
+        }
         try {
           // See if the message is a stringified JSON with another error
           const nestedError = JSON.parse(finalMessage) as unknown;
