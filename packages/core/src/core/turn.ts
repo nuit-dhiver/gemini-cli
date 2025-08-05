@@ -24,7 +24,7 @@ import {
   UnauthorizedError,
   toFriendlyError,
 } from '../utils/errors.js';
-import { GeminiChat } from './geminiChat.js';
+import { ChatSession } from './chatSession.js';
 
 // Define a structure for tools passed to the server
 export interface ServerTool {
@@ -41,7 +41,7 @@ export interface ServerTool {
   ): Promise<ToolCallConfirmationDetails | false>;
 }
 
-export enum GeminiEventType {
+export enum ChatEventType {
   Content = 'content',
   ToolCallRequest = 'tool_call_request',
   ToolCallResponse = 'tool_call_response',
@@ -54,6 +54,9 @@ export enum GeminiEventType {
   Finished = 'finished',
   LoopDetected = 'loop_detected',
 }
+
+// Keep backward compatibility alias
+export const GeminiEventType = ChatEventType;
 
 export interface StructuredError {
   message: string;
@@ -90,37 +93,37 @@ export type ThoughtSummary = {
   description: string;
 };
 
-export type ServerGeminiContentEvent = {
-  type: GeminiEventType.Content;
+export type ServerChatContentEvent = {
+  type: ChatEventType.Content;
   value: string;
 };
 
-export type ServerGeminiThoughtEvent = {
-  type: GeminiEventType.Thought;
+export type ServerChatThoughtEvent = {
+  type: ChatEventType.Thought;
   value: ThoughtSummary;
 };
 
-export type ServerGeminiToolCallRequestEvent = {
-  type: GeminiEventType.ToolCallRequest;
+export type ServerChatToolCallRequestEvent = {
+  type: ChatEventType.ToolCallRequest;
   value: ToolCallRequestInfo;
 };
 
-export type ServerGeminiToolCallResponseEvent = {
-  type: GeminiEventType.ToolCallResponse;
+export type ServerChatToolCallResponseEvent = {
+  type: ChatEventType.ToolCallResponse;
   value: ToolCallResponseInfo;
 };
 
-export type ServerGeminiToolCallConfirmationEvent = {
-  type: GeminiEventType.ToolCallConfirmation;
+export type ServerChatToolCallConfirmationEvent = {
+  type: ChatEventType.ToolCallConfirmation;
   value: ServerToolCallConfirmationDetails;
 };
 
-export type ServerGeminiUserCancelledEvent = {
-  type: GeminiEventType.UserCancelled;
+export type ServerChatUserCancelledEvent = {
+  type: ChatEventType.UserCancelled;
 };
 
-export type ServerGeminiErrorEvent = {
-  type: GeminiEventType.Error;
+export type ServerChatErrorEvent = {
+  type: ChatEventType.Error;
   value: GeminiErrorEventValue;
 };
 
@@ -129,37 +132,51 @@ export interface ChatCompressionInfo {
   newTokenCount: number;
 }
 
-export type ServerGeminiChatCompressedEvent = {
-  type: GeminiEventType.ChatCompressed;
+export type ServerChatCompressedEvent = {
+  type: ChatEventType.ChatCompressed;
   value: ChatCompressionInfo | null;
 };
 
-export type ServerGeminiMaxSessionTurnsEvent = {
-  type: GeminiEventType.MaxSessionTurns;
+export type ServerChatMaxSessionTurnsEvent = {
+  type: ChatEventType.MaxSessionTurns;
 };
 
-export type ServerGeminiFinishedEvent = {
-  type: GeminiEventType.Finished;
+export type ServerChatFinishedEvent = {
+  type: ChatEventType.Finished;
   value: FinishReason;
 };
 
-export type ServerGeminiLoopDetectedEvent = {
-  type: GeminiEventType.LoopDetected;
+export type ServerChatLoopDetectedEvent = {
+  type: ChatEventType.LoopDetected;
 };
 
-// The original union type, now composed of the individual types
-export type ServerGeminiStreamEvent =
-  | ServerGeminiContentEvent
-  | ServerGeminiToolCallRequestEvent
-  | ServerGeminiToolCallResponseEvent
-  | ServerGeminiToolCallConfirmationEvent
-  | ServerGeminiUserCancelledEvent
-  | ServerGeminiErrorEvent
-  | ServerGeminiChatCompressedEvent
-  | ServerGeminiThoughtEvent
-  | ServerGeminiMaxSessionTurnsEvent
-  | ServerGeminiFinishedEvent
-  | ServerGeminiLoopDetectedEvent;
+// Provider-agnostic stream event type
+export type ServerChatStreamEvent =
+  | ServerChatContentEvent
+  | ServerChatToolCallRequestEvent
+  | ServerChatToolCallResponseEvent
+  | ServerChatToolCallConfirmationEvent
+  | ServerChatUserCancelledEvent
+  | ServerChatErrorEvent
+  | ServerChatCompressedEvent
+  | ServerChatThoughtEvent
+  | ServerChatMaxSessionTurnsEvent
+  | ServerChatFinishedEvent
+  | ServerChatLoopDetectedEvent;
+
+// Keep backward compatibility aliases
+export type ServerGeminiContentEvent = ServerChatContentEvent;
+export type ServerGeminiThoughtEvent = ServerChatThoughtEvent;
+export type ServerGeminiToolCallRequestEvent = ServerChatToolCallRequestEvent;
+export type ServerGeminiToolCallResponseEvent = ServerChatToolCallResponseEvent;
+export type ServerGeminiToolCallConfirmationEvent = ServerChatToolCallConfirmationEvent;
+export type ServerGeminiUserCancelledEvent = ServerChatUserCancelledEvent;
+export type ServerGeminiErrorEvent = ServerChatErrorEvent;
+export type ServerGeminiChatCompressedEvent = ServerChatCompressedEvent;
+export type ServerGeminiMaxSessionTurnsEvent = ServerChatMaxSessionTurnsEvent;
+export type ServerGeminiFinishedEvent = ServerChatFinishedEvent;
+export type ServerGeminiLoopDetectedEvent = ServerChatLoopDetectedEvent;
+export type ServerGeminiStreamEvent = ServerChatStreamEvent;
 
 // A turn manages the agentic loop turn within the server context.
 export class Turn {
@@ -168,7 +185,7 @@ export class Turn {
   finishReason: FinishReason | undefined;
 
   constructor(
-    private readonly chat: GeminiChat,
+    private readonly chatSession: ChatSession,
     private readonly prompt_id: string,
   ) {
     this.pendingToolCalls = [];
@@ -179,11 +196,11 @@ export class Turn {
   async *run(
     req: PartListUnion,
     signal: AbortSignal,
-  ): AsyncGenerator<ServerGeminiStreamEvent> {
+  ): AsyncGenerator<ServerChatStreamEvent> {
     try {
-      const responseStream = await this.chat.sendMessageStream(
+      const responseStream = await this.chatSession.sendMessageStream(
         {
-          message: req,
+          message: Array.isArray(req) ? req : [req],
           config: {
             abortSignal: signal,
           },
@@ -193,7 +210,7 @@ export class Turn {
 
       for await (const resp of responseStream) {
         if (signal?.aborted) {
-          yield { type: GeminiEventType.UserCancelled };
+          yield { type: ChatEventType.UserCancelled };
           // Do not add resp to debugResponses if aborted before processing
           return;
         }
@@ -215,7 +232,7 @@ export class Turn {
           };
 
           yield {
-            type: GeminiEventType.Thought,
+            type: ChatEventType.Thought,
             value: thought,
           };
           continue;
@@ -223,7 +240,7 @@ export class Turn {
 
         const text = getResponseText(resp);
         if (text) {
-          yield { type: GeminiEventType.Content, value: text };
+          yield { type: ChatEventType.Content, value: text };
         }
 
         // Handle function calls (requesting tool execution)
@@ -241,7 +258,7 @@ export class Turn {
         if (finishReason) {
           this.finishReason = finishReason;
           yield {
-            type: GeminiEventType.Finished,
+            type: ChatEventType.Finished,
             value: finishReason as FinishReason,
           };
         }
@@ -252,15 +269,15 @@ export class Turn {
         throw error;
       }
       if (signal.aborted) {
-        yield { type: GeminiEventType.UserCancelled };
+        yield { type: ChatEventType.UserCancelled };
         // Regular cancellation error, fail gracefully.
         return;
       }
 
-      const contextForReport = [...this.chat.getHistory(/*curated*/ true), req];
+      const contextForReport = [...this.chatSession.getHistory(/*curated*/ true), req];
       await reportError(
         error,
-        'Error when talking to Gemini API',
+        `Error when talking to ${this.chatSession.provider} API`,
         contextForReport,
         'Turn.run-sendMessageStream',
       );
@@ -275,14 +292,14 @@ export class Turn {
         message: getErrorMessage(error),
         status,
       };
-      yield { type: GeminiEventType.Error, value: { error: structuredError } };
+      yield { type: ChatEventType.Error, value: { error: structuredError } };
       return;
     }
   }
 
   private handlePendingFunctionCall(
     fnCall: FunctionCall,
-  ): ServerGeminiStreamEvent | null {
+  ): ServerChatStreamEvent | null {
     const callId =
       fnCall.id ??
       `${fnCall.name}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -300,7 +317,7 @@ export class Turn {
     this.pendingToolCalls.push(toolCallRequest);
 
     // Yield a request for the tool call, not the pending/confirming status
-    return { type: GeminiEventType.ToolCallRequest, value: toolCallRequest };
+    return { type: ChatEventType.ToolCallRequest, value: toolCallRequest };
   }
 
   getDebugResponses(): GenerateContentResponse[] {

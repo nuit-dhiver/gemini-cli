@@ -173,7 +173,7 @@ export abstract class BaseProviderClient implements ProviderClient {
   /**
    * Create base unified response structure
    */
-  protected createBaseResponse(promptId: string): Partial<UnifiedResponse> {
+  protected createBaseResponse(promptId: string): Pick<UnifiedResponse, 'id' | 'provider' | 'model'> {
     return {
       id: this.generateResponseId(),
       provider: this.provider,

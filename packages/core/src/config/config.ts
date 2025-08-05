@@ -29,6 +29,12 @@ import {
 } from '../tools/memoryTool.js';
 import { WebSearchTool } from '../tools/web-search.js';
 import { GeminiClient } from '../core/client.js';
+import { ChatSession } from '../core/chatSession.js';
+import { ChatSessionManager, getSessionManager } from '../core/chatSessionManager.js';
+import { GeminiChatSessionFactory } from '../providers/gemini/GeminiChatSession.js';
+import { ClaudeChatSessionFactory } from '../providers/claude/ClaudeChatSession.js';
+import { OllamaChatSessionFactory } from '../providers/ollama/OllamaChatSession.js';
+import { AIProvider } from '../providers/types.js';
 import { FileDiscoveryService } from '../services/fileDiscoveryService.js';
 import { GitService } from '../services/gitService.js';
 import { getProjectTempDir } from '../utils/paths.js';
@@ -52,6 +58,7 @@ import type { Content } from '@google/genai';
 // Re-export OAuth config type
 export type { MCPOAuthConfig };
 import { WorkspaceContext } from '../utils/workspaceContext.js';
+import { EventEmitter } from 'events';
 
 export enum ApprovalMode {
   DEFAULT = 'default',
@@ -190,7 +197,7 @@ export interface ConfigParameters {
   ideClient: IdeClient;
 }
 
-export class Config {
+export class Config extends EventEmitter {
   private toolRegistry!: ToolRegistry;
   private promptRegistry!: PromptRegistry;
   private readonly sessionId: string;
@@ -247,8 +254,13 @@ export class Config {
     | Record<string, SummarizeToolOutputSettings>
     | undefined;
   private readonly experimentalAcp: boolean = false;
+  
+  // Chat session management
+  private chatSessionManager?: ChatSessionManager;
+  private activeChatSession?: ChatSession;
 
   constructor(params: ConfigParameters) {
+    super();
     this.sessionId = params.sessionId;
     this.embeddingModel =
       params.embeddingModel ?? DEFAULT_GEMINI_EMBEDDING_MODEL;
@@ -534,6 +546,145 @@ export class Config {
     return this.geminiClient;
   }
 
+  /**
+   * Generic getter for configuration values and environment variables
+   */
+  get(key: string): string | undefined {
+    // First check environment variables
+    const envValue = process.env[key];
+    if (envValue) {
+      return envValue;
+    }
+
+    // Add specific config mappings as needed
+    switch (key) {
+      case 'ANTHROPIC_API_KEY':
+        return process.env.ANTHROPIC_API_KEY;
+      case 'CLAUDE_ENDPOINT':
+        return process.env.CLAUDE_ENDPOINT;
+      case 'OLLAMA_HOST':
+        return process.env.OLLAMA_HOST;
+      case 'OLLAMA_ENDPOINT':
+        return process.env.OLLAMA_ENDPOINT;
+      default:
+        return undefined;
+    }
+  }
+
+  /**
+   * Initialize the chat session manager with all provider factories
+   */
+  private async initializeChatSessionManager(): Promise<ChatSessionManager> {
+    if (this.chatSessionManager) {
+      return this.chatSessionManager;
+    }
+
+    this.chatSessionManager = getSessionManager(this);
+
+    // Register provider factories
+    this.chatSessionManager.registerProvider(
+      AIProvider.GEMINI,
+      new GeminiChatSessionFactory(this),
+    );
+    
+    this.chatSessionManager.registerProvider(
+      AIProvider.CLAUDE,
+      new ClaudeChatSessionFactory(this),
+    );
+    
+    this.chatSessionManager.registerProvider(
+      AIProvider.OLLAMA,
+      new OllamaChatSessionFactory(this),
+    );
+
+    return this.chatSessionManager;
+  }
+
+  /**
+   * Get the chat session manager, initializing if necessary
+   */
+  async getChatSessionManager(): Promise<ChatSessionManager> {
+    return this.initializeChatSessionManager();
+  }
+
+  /**
+   * Get the active chat session, creating a default Gemini session if none exists
+   */
+  async getActiveChatSession(): Promise<ChatSession> {
+    if (this.activeChatSession) {
+      return this.activeChatSession;
+    }
+
+    // Create default Gemini session for backward compatibility
+    const manager = await this.getChatSessionManager();
+    this.activeChatSession = await manager.createSession(
+      AIProvider.GEMINI,
+      this.getModel(),
+    );
+
+    return this.activeChatSession;
+  }
+
+  /**
+   * Set the active chat session
+   */
+  setActiveChatSession(session: ChatSession): void {
+    this.activeChatSession = session;
+  }
+
+  /**
+   * Create a new chat session with the specified provider
+   */
+  async createChatSession(
+    provider: AIProvider,
+    model?: string,
+    config?: any,
+  ): Promise<ChatSession> {
+    const manager = await this.getChatSessionManager();
+    const session = await manager.createSession(
+      provider,
+      model || this.getModel(),
+      config,
+    );
+
+    // Set as active if no active session
+    if (!this.activeChatSession) {
+      this.activeChatSession = session;
+    }
+
+    return session;
+  }
+
+  /**
+   * Switch to a different chat session by session ID
+   */
+  async switchChatSession(sessionId: string): Promise<void> {
+    const manager = await this.getChatSessionManager();
+    const session = manager.getSession(sessionId);
+    
+    if (!session) {
+      throw new Error(`Chat session not found: ${sessionId}`);
+    }
+
+    this.activeChatSession = session;
+    manager.setActiveSession(sessionId);
+  }
+
+  /**
+   * Get all available chat sessions
+   */
+  async getAllChatSessions(): Promise<ChatSession[]> {
+    const manager = await this.getChatSessionManager();
+    return manager.getAllSessions();
+  }
+
+  /**
+   * Check if multi-provider mode is enabled
+   */
+  isMultiProviderMode(): boolean {
+    return this.activeChatSession !== undefined;
+  }
+
   getGeminiDir(): string {
     return path.join(this.targetDir, GEMINI_DIR);
   }
@@ -703,6 +854,18 @@ export class Config {
 
     await registry.discoverAllTools();
     return registry;
+  }
+
+  /**
+   * Clean up resources including chat sessions
+   */
+  async dispose(): Promise<void> {
+    if (this.chatSessionManager) {
+      await this.chatSessionManager.dispose();
+      this.chatSessionManager = undefined;
+    }
+    
+    this.activeChatSession = undefined;
   }
 }
 // Export model constants for use in CLI

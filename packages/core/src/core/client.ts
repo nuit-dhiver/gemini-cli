@@ -29,6 +29,8 @@ import { getResponseText } from '../utils/generateContentResponseUtilities.js';
 import { checkNextSpeaker } from '../utils/nextSpeakerChecker.js';
 import { reportError } from '../utils/errorReporting.js';
 import { GeminiChat } from './geminiChat.js';
+import { ChatSession } from './chatSession.js';
+import { GeminiChatSession } from '../providers/gemini/GeminiChatSession.js';
 import { retryWithBackoff } from '../utils/retry.js';
 import { getErrorMessage } from '../utils/errors.js';
 import { isFunctionResponse } from '../utils/messageInspectors.js';
@@ -151,6 +153,29 @@ export class GeminiClient {
       throw new Error('Chat not initialized');
     }
     return this.chat;
+  }
+
+  /**
+   * Get a ChatSession interface that wraps the current GeminiChat
+   * This provides a provider-agnostic interface for the Turn class
+   */
+  async getChatSession(): Promise<ChatSession> {
+    if (!this.contentGenerator) {
+      throw new Error('Content generator not initialized');
+    }
+
+    const sessionId = `gemini-legacy-${this.config.getSessionId()}`;
+    const chatSession = new GeminiChatSession(
+      sessionId,
+      this.config.getModel(),
+      this.config,
+      this.contentGenerator,
+    );
+
+    // Initialize the session to use the existing GeminiClient/GeminiChat
+    await chatSession.initialize();
+    
+    return chatSession;
   }
 
   isInitialized(): boolean {
@@ -357,12 +382,12 @@ export class GeminiClient {
       this.sessionTurnCount > this.config.getMaxSessionTurns()
     ) {
       yield { type: GeminiEventType.MaxSessionTurns };
-      return new Turn(this.getChat(), prompt_id);
+      return new Turn(await this.getChatSession(), prompt_id);
     }
     // Ensure turns never exceeds MAX_TURNS to prevent infinite loops
     const boundedTurns = Math.min(turns, this.MAX_TURNS);
     if (!boundedTurns) {
-      return new Turn(this.getChat(), prompt_id);
+      return new Turn(await this.getChatSession(), prompt_id);
     }
 
     // Track the original model from the first call to detect model switching
@@ -420,7 +445,7 @@ export class GeminiClient {
       }
     }
 
-    const turn = new Turn(this.getChat(), prompt_id);
+    const turn = new Turn(await this.getChatSession(), prompt_id);
 
     const loopDetected = await this.loopDetector.turnStarted(signal);
     if (loopDetected) {
