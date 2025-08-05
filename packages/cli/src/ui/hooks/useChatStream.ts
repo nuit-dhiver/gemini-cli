@@ -8,25 +8,17 @@ import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { useInput } from 'ink';
 import {
   Config,
-  GeminiClient,
-  GeminiEventType as ServerGeminiEventType,
-  ServerGeminiStreamEvent as GeminiEvent,
-  ServerGeminiContentEvent as ContentEvent,
-  ServerGeminiErrorEvent as ErrorEvent,
-  ServerGeminiChatCompressedEvent,
-  ServerGeminiFinishedEvent,
-  getErrorMessage,
-  isNodeError,
-  MessageSenderType,
+  ChatSession,
+  AIProvider,
   ToolCallRequestInfo,
   logUserPrompt,
   GitService,
   EditorType,
-  ThoughtSummary,
   UnauthorizedError,
   UserPromptEvent,
+  isNodeError,
+  getErrorMessage,
 } from '@google/gemini-cli-core';
-import { GEMINI_MODELS } from '../../../../../core/src/providers/gemini/GeminiConfig.js';
 import { type Part, type PartListUnion, FinishReason } from '@google/genai';
 import {
   StreamingState,
@@ -37,6 +29,26 @@ import {
   SlashCommandProcessorResult,
   ToolCallStatus,
 } from '../types.js';
+import {
+  ChatStreamEvent,
+  ChatStreamEventType,
+  ChatStreamEventBus,
+  ChatStreamConfig,
+  ChatStreamState,
+  ChatStreamStatus,
+  TokenEvent,
+  ContentEvent,
+  ThoughtEvent,
+  ToolCallEvent,
+  ToolResultEvent,
+  ErrorEvent,
+  EndEvent,
+  CancelledEvent,
+  ContextCompressedEvent,
+  SessionLimitEvent,
+  LoopDetectedEvent,
+} from '../types/chatEvents.js';
+import { createChatEventBus, EventConverters } from '../utils/chatEventBus.js';
 import { isAtCommand } from '../utils/commandUtils.js';
 import { parseAndFormatApiError } from '../utils/errorParsing.js';
 import { useShellCommandProcessor } from './shellCommandProcessor.js';
@@ -75,11 +87,24 @@ enum StreamProcessingStatus {
 }
 
 /**
- * Manages the Gemini stream, including user input, command processing,
- * API interaction, and tool call lifecycle.
+ * Configuration for the chat stream hook
  */
-export const useGeminiStream = (
-  geminiClient: GeminiClient,
+export interface UseChatStreamConfig {
+  provider?: AIProvider;
+  model?: string;
+  sessionId?: string;
+  enableThoughts?: boolean;
+  enableToolCalls?: boolean;
+  bufferEvents?: boolean;
+  bufferTimeoutMs?: number;
+}
+
+/**
+ * Provider-agnostic chat streaming hook that replaces useGeminiStream
+ * Supports multiple AI providers through a unified event bus system
+ */
+export const useChatStream = (
+  chatSession: ChatSession,
   history: HistoryItem[],
   addItem: UseHistoryManagerReturn['addItem'],
   config: Config,
@@ -93,17 +118,31 @@ export const useGeminiStream = (
   performMemoryRefresh: () => Promise<void>,
   modelSwitchedFromQuotaError: boolean,
   setModelSwitchedFromQuotaError: React.Dispatch<React.SetStateAction<boolean>>,
+  streamConfig?: UseChatStreamConfig,
 ) => {
+  // Event bus for provider-agnostic event handling
+  const eventBus = useMemo(() => createChatEventBus(), []);
+  
+  // Stream state
+  const [streamState, setStreamState] = useState<ChatStreamState>(ChatStreamState.IDLE);
+  const [streamStatus, setStreamStatus] = useState<ChatStreamStatus>({
+    state: ChatStreamState.IDLE,
+    provider: chatSession.provider,
+    model: chatSession.model,
+    sessionId: chatSession.sessionId,
+  });
+
   const [initError, setInitError] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const turnCancelledRef = useRef(false);
   const [isResponding, setIsResponding] = useState<boolean>(false);
-  const [thought, setThought] = useState<ThoughtSummary | null>(null);
+  const [thought, setThought] = useState<{ subject: string; description: string } | null>(null);
   const [pendingHistoryItemRef, setPendingHistoryItem] =
     useStateAndRef<HistoryItemWithoutId | null>(null);
   const processedMemoryToolsRef = useRef<Set<string>>(new Set());
   const { startNewPrompt, getPromptCount } = useSessionStats();
   const logger = useLogger();
+  
   const gitService = useMemo(() => {
     if (!config.getProjectRoot()) {
       return;
@@ -143,20 +182,7 @@ export const useGeminiStream = (
 
   const loopDetectedRef = useRef(false);
 
-  const onExec = useCallback(async (done: Promise<void>) => {
-    setIsResponding(true);
-    await done;
-    setIsResponding(false);
-  }, []);
-  const { handleShellCommand } = useShellCommandProcessor(
-    addItem,
-    setPendingHistoryItem,
-    onExec,
-    onDebugMessage,
-    config,
-    geminiClient,
-  );
-
+  // Convert StreamingState from tool calls to ChatStreamState
   const streamingState = useMemo(() => {
     if (toolCalls.some((tc) => tc.status === 'awaiting_approval')) {
       return StreamingState.WaitingForConfirmation;
@@ -180,6 +206,110 @@ export const useGeminiStream = (
     return StreamingState.Idle;
   }, [isResponding, toolCalls]);
 
+  // Update stream status when state changes
+  useEffect(() => {
+    const newStatus: ChatStreamStatus = {
+      state: streamState,
+      provider: chatSession.provider,
+      model: chatSession.model,
+      sessionId: chatSession.sessionId,
+      currentThought: thought || undefined,
+      pendingToolCalls: toolCalls.map(tc => ({
+        callId: tc.request.callId,
+        name: tc.request.name,
+        status: tc.status === 'awaiting_approval' ? 'awaiting_confirmation' :
+                tc.status === 'executing' ? 'executing' : 'pending',
+      })),
+    };
+    setStreamStatus(newStatus);
+  }, [streamState, chatSession, thought, toolCalls]);
+
+  // Event bus handlers
+  useEffect(() => {
+    const unsubscribeToken = eventBus.on(ChatStreamEventType.TOKEN, (event: TokenEvent) => {
+      handleContentEvent(event.data, '', Date.now());
+    });
+
+    const unsubscribeContent = eventBus.on(ChatStreamEventType.CONTENT, (event: ContentEvent) => {
+      handleContentEvent(event.data, '', Date.now());
+    });
+
+    const unsubscribeThought = eventBus.on(ChatStreamEventType.THOUGHT, (event: ThoughtEvent) => {
+      setThought(event.data);
+    });
+
+    const unsubscribeToolCall = eventBus.on(ChatStreamEventType.TOOL_CALL, (event: ToolCallEvent) => {
+      const toolCallRequest: ToolCallRequestInfo = {
+        callId: event.data.callId,
+        name: event.data.name,
+        args: event.data.args,
+        isClientInitiated: event.data.isClientInitiated,
+        prompt_id: event.sessionId || config.getSessionId(),
+      };
+      scheduleToolCalls([toolCallRequest], abortControllerRef.current?.signal || new AbortController().signal);
+    });
+
+    const unsubscribeError = eventBus.on(ChatStreamEventType.ERROR, (event: ErrorEvent) => {
+      handleErrorEvent(event, Date.now());
+    });
+
+    const unsubscribeEnd = eventBus.on(ChatStreamEventType.END, (event: EndEvent) => {
+      handleFinishedEvent(event, Date.now());
+      setStreamState(ChatStreamState.FINISHED);
+    });
+
+    const unsubscribeCancelled = eventBus.on(ChatStreamEventType.CANCELLED, (event: CancelledEvent) => {
+      handleUserCancelledEvent(Date.now());
+      setStreamState(ChatStreamState.CANCELLED);
+    });
+
+    const unsubscribeCompressed = eventBus.on(ChatStreamEventType.CONTEXT_COMPRESSED, (event: ContextCompressedEvent) => {
+      handleChatCompressionEvent(event);
+    });
+
+    const unsubscribeSessionLimit = eventBus.on(ChatStreamEventType.SESSION_LIMIT, (event: SessionLimitEvent) => {
+      handleMaxSessionTurnsEvent();
+    });
+
+    const unsubscribeLoopDetected = eventBus.on(ChatStreamEventType.LOOP_DETECTED, (event: LoopDetectedEvent) => {
+      loopDetectedRef.current = true;
+    });
+
+    return () => {
+      unsubscribeToken();
+      unsubscribeContent();
+      unsubscribeThought();
+      unsubscribeToolCall();
+      unsubscribeError();
+      unsubscribeEnd();
+      unsubscribeCancelled();
+      unsubscribeCompressed();
+      unsubscribeSessionLimit();
+      unsubscribeLoopDetected();
+    };
+  }, [eventBus, config, scheduleToolCalls]);
+
+  const onExec = useCallback(async (done: Promise<void>) => {
+    setIsResponding(true);
+    setStreamState(ChatStreamState.STREAMING);
+    await done;
+    setIsResponding(false);
+    setStreamState(ChatStreamState.IDLE);
+  }, []);
+
+  const { handleShellCommand } = useShellCommandProcessor(
+    addItem,
+    setPendingHistoryItem,
+    onExec,
+    onDebugMessage,
+    config,
+    // Pass a compatibility layer for GeminiClient interface
+    {
+      addHistory: (content: any) => chatSession.addHistory(content),
+      getHistory: () => chatSession.getHistory(),
+    } as any,
+  );
+
   useInput((_input, key) => {
     if (streamingState === StreamingState.Responding && key.escape) {
       if (turnCancelledRef.current) {
@@ -199,10 +329,20 @@ export const useGeminiStream = (
       );
       setPendingHistoryItem(null);
       setIsResponding(false);
+      setStreamState(ChatStreamState.CANCELLED);
+      
+      // Emit cancelled event
+      eventBus.emit({
+        type: ChatStreamEventType.CANCELLED,
+        provider: chatSession.provider,
+        timestamp: Date.now(),
+        sessionId: chatSession.sessionId,
+        data: { reason: 'user' },
+      });
     }
   });
 
-  const prepareQueryForGemini = useCallback(
+  const prepareQueryForChat = useCallback(
     async (
       query: PartListUnion,
       userMessageTimestamp: number,
@@ -219,7 +359,7 @@ export const useGeminiStream = (
         return { queryToSend: null, shouldProceed: false };
       }
 
-      let localQueryToSendToGemini: PartListUnion | null = null;
+      let localQueryToSendToChat: PartListUnion | null = null;
 
       if (typeof query === 'string') {
         const trimmedQuery = query.trim();
@@ -233,7 +373,7 @@ export const useGeminiStream = (
           ),
         );
         onDebugMessage(`User query: '${trimmedQuery}'`);
-        await logger?.logMessage(MessageSenderType.USER, trimmedQuery);
+        await logger?.logMessage('user' as any, trimmedQuery);
 
         // Handle UI-only commands first
         const slashCommandResult = await handleSlashCommand(trimmedQuery);
@@ -253,10 +393,9 @@ export const useGeminiStream = (
               return { queryToSend: null, shouldProceed: false };
             }
             case 'submit_prompt': {
-              localQueryToSendToGemini = slashCommandResult.content;
-
+              localQueryToSendToChat = slashCommandResult.content;
               return {
-                queryToSend: localQueryToSendToGemini,
+                queryToSend: localQueryToSendToChat,
                 shouldProceed: true,
               };
             }
@@ -289,27 +428,27 @@ export const useGeminiStream = (
           if (!atCommandResult.shouldProceed) {
             return { queryToSend: null, shouldProceed: false };
           }
-          localQueryToSendToGemini = atCommandResult.processedQuery;
+          localQueryToSendToChat = atCommandResult.processedQuery;
         } else {
-          // Normal query for Gemini
+          // Normal query for Chat
           addItem(
             { type: MessageType.USER, text: trimmedQuery },
             userMessageTimestamp,
           );
-          localQueryToSendToGemini = trimmedQuery;
+          localQueryToSendToChat = trimmedQuery;
         }
       } else {
         // It's a function response (PartListUnion that isn't a string)
-        localQueryToSendToGemini = query;
+        localQueryToSendToChat = query;
       }
 
-      if (localQueryToSendToGemini === null) {
+      if (localQueryToSendToChat === null) {
         onDebugMessage(
-          'Query processing resulted in null, not sending to Gemini.',
+          'Query processing resulted in null, not sending to chat session.',
         );
         return { queryToSend: null, shouldProceed: false };
       }
-      return { queryToSend: localQueryToSendToGemini, shouldProceed: true };
+      return { queryToSend: localQueryToSendToChat, shouldProceed: true };
     },
     [
       config,
@@ -327,15 +466,15 @@ export const useGeminiStream = (
 
   const handleContentEvent = useCallback(
     (
-      eventValue: ContentEvent['value'],
-      currentGeminiMessageBuffer: string,
+      eventValue: string,
+      currentMessageBuffer: string,
       userMessageTimestamp: number,
     ): string => {
       if (turnCancelledRef.current) {
         // Prevents additional output after a user initiated cancel.
         return '';
       }
-      let newGeminiMessageBuffer = currentGeminiMessageBuffer + eventValue;
+      let newMessageBuffer = currentMessageBuffer + eventValue;
       if (
         pendingHistoryItemRef.current?.type !== 'gemini' &&
         pendingHistoryItemRef.current?.type !== 'gemini_content'
@@ -344,28 +483,20 @@ export const useGeminiStream = (
           addItem(pendingHistoryItemRef.current, userMessageTimestamp);
         }
         setPendingHistoryItem({ type: 'gemini', text: '' });
-        newGeminiMessageBuffer = eventValue;
+        newMessageBuffer = eventValue;
       }
-      // Split large messages for better rendering performance. Ideally,
-      // we should maximize the amount of output sent to <Static />.
-      const splitPoint = findLastSafeSplitPoint(newGeminiMessageBuffer);
-      if (splitPoint === newGeminiMessageBuffer.length) {
+      // Split large messages for better rendering performance
+      const splitPoint = findLastSafeSplitPoint(newMessageBuffer);
+      if (splitPoint === newMessageBuffer.length) {
         // Update the existing message with accumulated content
         setPendingHistoryItem((item) => ({
           type: item?.type as 'gemini' | 'gemini_content',
-          text: newGeminiMessageBuffer,
+          text: newMessageBuffer,
         }));
       } else {
-        // This indicates that we need to split up this Gemini Message.
-        // Splitting a message is primarily a performance consideration. There is a
-        // <Static> component at the root of App.tsx which takes care of rendering
-        // content statically or dynamically. Everything but the last message is
-        // treated as static in order to prevent re-rendering an entire message history
-        // multiple times per-second (as streaming occurs). Prior to this change you'd
-        // see heavy flickering of the terminal. This ensures that larger messages get
-        // broken up so that there are more "statically" rendered.
-        const beforeText = newGeminiMessageBuffer.substring(0, splitPoint);
-        const afterText = newGeminiMessageBuffer.substring(splitPoint);
+        // Split the message for performance
+        const beforeText = newMessageBuffer.substring(0, splitPoint);
+        const afterText = newMessageBuffer.substring(splitPoint);
         addItem(
           {
             type: pendingHistoryItemRef.current?.type as
@@ -376,9 +507,9 @@ export const useGeminiStream = (
           userMessageTimestamp,
         );
         setPendingHistoryItem({ type: 'gemini_content', text: afterText });
-        newGeminiMessageBuffer = afterText;
+        newMessageBuffer = afterText;
       }
-      return newGeminiMessageBuffer;
+      return newMessageBuffer;
     },
     [addItem, pendingHistoryItemRef, setPendingHistoryItem],
   );
@@ -413,13 +544,13 @@ export const useGeminiStream = (
         userMessageTimestamp,
       );
       setIsResponding(false);
-      setThought(null); // Reset thought when user cancels
+      setThought(null);
     },
     [addItem, pendingHistoryItemRef, setPendingHistoryItem, setThought],
   );
 
   const handleErrorEvent = useCallback(
-    (eventValue: ErrorEvent['value'], userMessageTimestamp: number) => {
+    (event: ErrorEvent, userMessageTimestamp: number) => {
       if (pendingHistoryItemRef.current) {
         addItem(pendingHistoryItemRef.current, userMessageTimestamp);
         setPendingHistoryItem(null);
@@ -428,47 +559,43 @@ export const useGeminiStream = (
         {
           type: MessageType.ERROR,
           text: parseAndFormatApiError(
-            eventValue.error,
+            event.data.message,
             config.getContentGeneratorConfig()?.authType,
             undefined,
-            config.getModel(),
-            GEMINI_MODELS.FLASH,
+            chatSession.model,
+            'gemini-2.0-flash-exp', // Default fallback model
           ),
         },
         userMessageTimestamp,
       );
-      setThought(null); // Reset thought when there's an error
+      setThought(null);
+      setStreamState(ChatStreamState.ERROR);
     },
-    [addItem, pendingHistoryItemRef, setPendingHistoryItem, config, setThought],
+    [addItem, pendingHistoryItemRef, setPendingHistoryItem, config, setThought, chatSession.model],
   );
 
   const handleFinishedEvent = useCallback(
-    (event: ServerGeminiFinishedEvent, userMessageTimestamp: number) => {
-      const finishReason = event.value;
+    (event: EndEvent, userMessageTimestamp: number) => {
+      const finishReason = event.data.reason;
 
-      const finishReasonMessages: Record<FinishReason, string | undefined> = {
-        [FinishReason.FINISH_REASON_UNSPECIFIED]: undefined,
-        [FinishReason.STOP]: undefined,
-        [FinishReason.MAX_TOKENS]: 'Response truncated due to token limits.',
-        [FinishReason.SAFETY]: 'Response stopped due to safety reasons.',
-        [FinishReason.RECITATION]: 'Response stopped due to recitation policy.',
-        [FinishReason.LANGUAGE]:
-          'Response stopped due to unsupported language.',
-        [FinishReason.BLOCKLIST]: 'Response stopped due to forbidden terms.',
-        [FinishReason.PROHIBITED_CONTENT]:
-          'Response stopped due to prohibited content.',
-        [FinishReason.SPII]:
-          'Response stopped due to sensitive personally identifiable information.',
-        [FinishReason.OTHER]: 'Response stopped for other reasons.',
-        [FinishReason.MALFORMED_FUNCTION_CALL]:
-          'Response stopped due to malformed function call.',
-        [FinishReason.IMAGE_SAFETY]:
-          'Response stopped due to image safety violations.',
-        [FinishReason.UNEXPECTED_TOOL_CALL]:
-          'Response stopped due to unexpected tool call.',
+      // Handle different finish reasons
+      const finishReasonMessages: Record<string, string | undefined> = {
+        'FINISH_REASON_UNSPECIFIED': undefined,
+        'STOP': undefined,
+        'MAX_TOKENS': 'Response truncated due to token limits.',
+        'SAFETY': 'Response stopped due to safety reasons.',
+        'RECITATION': 'Response stopped due to recitation policy.',
+        'LANGUAGE': 'Response stopped due to unsupported language.',
+        'BLOCKLIST': 'Response stopped due to forbidden terms.',
+        'PROHIBITED_CONTENT': 'Response stopped due to prohibited content.',
+        'SPII': 'Response stopped due to sensitive personally identifiable information.',
+        'OTHER': 'Response stopped for other reasons.',
+        'MALFORMED_FUNCTION_CALL': 'Response stopped due to malformed function call.',
+        'IMAGE_SAFETY': 'Response stopped due to image safety violations.',
+        'UNEXPECTED_TOOL_CALL': 'Response stopped due to unexpected tool call.',
       };
 
-      const message = finishReasonMessages[finishReason];
+      const message = finishReasonMessages[finishReason as string];
       if (message) {
         addItem(
           {
@@ -483,19 +610,19 @@ export const useGeminiStream = (
   );
 
   const handleChatCompressionEvent = useCallback(
-    (eventValue: ServerGeminiChatCompressedEvent['value']) =>
+    (event: ContextCompressedEvent) =>
       addItem(
         {
           type: 'info',
           text:
-            `IMPORTANT: This conversation approached the input token limit for ${config.getModel()}. ` +
+            `IMPORTANT: This conversation approached the input token limit for ${chatSession.model}. ` +
             `A compressed context will be sent for future messages (compressed from: ` +
-            `${eventValue?.originalTokenCount ?? 'unknown'} to ` +
-            `${eventValue?.newTokenCount ?? 'unknown'} tokens).`,
+            `${event.data.originalTokenCount} to ` +
+            `${event.data.newTokenCount} tokens).`,
         },
         Date.now(),
       ),
-    [addItem, config],
+    [addItem, chatSession.model],
   );
 
   const handleMaxSessionTurnsEvent = useCallback(
@@ -522,77 +649,71 @@ export const useGeminiStream = (
     );
   }, [addItem]);
 
-  const processGeminiStreamEvents = useCallback(
+  const processChatStreamEvents = useCallback(
     async (
-      stream: AsyncIterable<GeminiEvent>,
+      stream: AsyncIterable<any>, // Provider-specific stream
       userMessageTimestamp: number,
       signal: AbortSignal,
     ): Promise<StreamProcessingStatus> => {
-      let geminiMessageBuffer = '';
-      const toolCallRequests: ToolCallRequestInfo[] = [];
-      for await (const event of stream) {
-        switch (event.type) {
-          case ServerGeminiEventType.Thought:
-            setThought(event.value);
-            break;
-          case ServerGeminiEventType.Content:
-            geminiMessageBuffer = handleContentEvent(
-              event.value,
-              geminiMessageBuffer,
-              userMessageTimestamp,
-            );
-            break;
-          case ServerGeminiEventType.ToolCallRequest:
-            toolCallRequests.push(event.value);
-            break;
-          case ServerGeminiEventType.UserCancelled:
-            handleUserCancelledEvent(userMessageTimestamp);
-            break;
-          case ServerGeminiEventType.Error:
-            handleErrorEvent(event.value, userMessageTimestamp);
-            break;
-          case ServerGeminiEventType.ChatCompressed:
-            handleChatCompressionEvent(event.value);
-            break;
-          case ServerGeminiEventType.ToolCallConfirmation:
-          case ServerGeminiEventType.ToolCallResponse:
-            // do nothing
-            break;
-          case ServerGeminiEventType.MaxSessionTurns:
-            handleMaxSessionTurnsEvent();
-            break;
-          case ServerGeminiEventType.Finished:
-            handleFinishedEvent(
-              event as ServerGeminiFinishedEvent,
-              userMessageTimestamp,
-            );
-            break;
-          case ServerGeminiEventType.LoopDetected:
-            // handle later because we want to move pending history to history
-            // before we add loop detected message to history
-            loopDetectedRef.current = true;
-            break;
-          default: {
-            // enforces exhaustive switch-case
-            const unreachable: never = event;
-            return unreachable;
+      setStreamState(ChatStreamState.STREAMING);
+      
+      try {
+        for await (const event of stream) {
+          // Convert provider-specific events to generic chat events
+          let chatEvent: ChatStreamEvent | null = null;
+          
+          // Use the appropriate converter based on provider
+          switch (chatSession.provider) {
+            case AIProvider.GEMINI:
+              chatEvent = EventConverters.fromGeminiEvent(
+                event,
+                chatSession.provider,
+                chatSession.sessionId,
+              );
+              break;
+            case AIProvider.CLAUDE:
+              chatEvent = EventConverters.fromClaudeEvent(
+                event,
+                chatSession.provider,
+                chatSession.sessionId,
+              );
+              break;
+            case AIProvider.OLLAMA:
+              chatEvent = EventConverters.fromOllamaEvent(
+                event,
+                chatSession.provider,
+                chatSession.sessionId,
+              );
+              break;
+          }
+
+          // Emit the converted event
+          if (chatEvent) {
+            eventBus.emit(chatEvent);
           }
         }
+        
+        setStreamState(ChatStreamState.FINISHED);
+        return StreamProcessingStatus.Completed;
+      } catch (error) {
+        setStreamState(ChatStreamState.ERROR);
+        
+        // Emit error event
+        eventBus.emit({
+          type: ChatStreamEventType.ERROR,
+          provider: chatSession.provider,
+          timestamp: Date.now(),
+          sessionId: chatSession.sessionId,
+          data: {
+            message: getErrorMessage(error) || 'Unknown error',
+            recoverable: false,
+          },
+        });
+        
+        return StreamProcessingStatus.Error;
       }
-      if (toolCallRequests.length > 0) {
-        scheduleToolCalls(toolCallRequests, signal);
-      }
-      return StreamProcessingStatus.Completed;
     },
-    [
-      handleContentEvent,
-      handleUserCancelledEvent,
-      handleErrorEvent,
-      scheduleToolCalls,
-      handleChatCompressionEvent,
-      handleFinishedEvent,
-      handleMaxSessionTurnsEvent,
-    ],
+    [eventBus, chatSession],
   );
 
   const submitQuery = useCallback(
@@ -613,7 +734,7 @@ export const useGeminiStream = (
       // Reset quota error flag when starting a new query (not a continuation)
       if (!options?.isContinuation) {
         setModelSwitchedFromQuotaError(false);
-        config.setQuotaErrorOccurred(false);
+        config.setQuotaErrorOccurred?.(false);
       }
 
       abortControllerRef.current = new AbortController();
@@ -624,7 +745,7 @@ export const useGeminiStream = (
         prompt_id = config.getSessionId() + '########' + getPromptCount();
       }
 
-      const { queryToSend, shouldProceed } = await prepareQueryForGemini(
+      const { queryToSend, shouldProceed } = await prepareQueryForChat(
         query,
         userMessageTimestamp,
         abortSignal,
@@ -637,19 +758,37 @@ export const useGeminiStream = (
 
       if (!options?.isContinuation) {
         startNewPrompt();
-        setThought(null); // Reset thought when starting a new prompt
+        setThought(null);
       }
 
       setIsResponding(true);
       setInitError(null);
+      setStreamState(ChatStreamState.STREAMING);
 
       try {
-        const stream = geminiClient.sendMessageStream(
-          queryToSend,
-          abortSignal,
+        // Emit start event
+        eventBus.emit({
+          type: ChatStreamEventType.START,
+          provider: chatSession.provider,
+          timestamp: Date.now(),
+          sessionId: chatSession.sessionId,
+          data: {
+            model: chatSession.model,
+            provider: chatSession.provider,
+          },
+        });
+
+        const stream = chatSession.sendMessageStream(
+          {
+            message: queryToSend,
+            config: {
+              abortSignal,
+            },
+          },
           prompt_id!,
         );
-        const processingStatus = await processGeminiStreamEvents(
+        
+        const processingStatus = await processChatStreamEvents(
           stream,
           userMessageTimestamp,
           abortSignal,
@@ -678,8 +817,8 @@ export const useGeminiStream = (
                 getErrorMessage(error) || 'Unknown error',
                 config.getContentGeneratorConfig()?.authType,
                 undefined,
-                config.getModel(),
-                GEMINI_MODELS.FLASH,
+                chatSession.model,
+                'gemini-2.0-flash-exp',
               ),
             },
             userMessageTimestamp,
@@ -687,23 +826,25 @@ export const useGeminiStream = (
         }
       } finally {
         setIsResponding(false);
+        setStreamState(ChatStreamState.IDLE);
       }
     },
     [
       streamingState,
       setModelSwitchedFromQuotaError,
-      prepareQueryForGemini,
-      processGeminiStreamEvents,
+      prepareQueryForChat,
+      processChatStreamEvents,
       pendingHistoryItemRef,
       addItem,
       setPendingHistoryItem,
       setInitError,
-      geminiClient,
+      chatSession,
       onAuthError,
       config,
       startNewPrompt,
       getPromptCount,
       handleLoopDetectedEvent,
+      eventBus,
     ],
   );
 
@@ -760,57 +901,55 @@ export const useGeminiStream = (
         );
       }
 
-      const geminiTools = completedAndReadyToSubmitTools.filter(
+      const chatTools = completedAndReadyToSubmitTools.filter(
         (t) => !t.request.isClientInitiated,
       );
 
-      if (geminiTools.length === 0) {
+      if (chatTools.length === 0) {
         return;
       }
 
-      // If all the tools were cancelled, don't submit a response to Gemini.
-      const allToolsCancelled = geminiTools.every(
+      // If all the tools were cancelled, don't submit a response to the chat session.
+      const allToolsCancelled = chatTools.every(
         (tc) => tc.status === 'cancelled',
       );
 
       if (allToolsCancelled) {
-        if (geminiClient) {
-          // We need to manually add the function responses to the history
-          // so the model knows the tools were cancelled.
-          const responsesToAdd = geminiTools.flatMap(
-            (toolCall) => toolCall.response.responseParts,
-          );
-          const combinedParts: Part[] = [];
-          for (const response of responsesToAdd) {
-            if (Array.isArray(response)) {
-              combinedParts.push(...response);
-            } else if (typeof response === 'string') {
-              combinedParts.push({ text: response });
-            } else {
-              combinedParts.push(response);
-            }
+        // We need to manually add the function responses to the history
+        // so the model knows the tools were cancelled.
+        const responsesToAdd = chatTools.flatMap(
+          (toolCall) => toolCall.response.responseParts,
+        );
+        const combinedParts: Part[] = [];
+        for (const response of responsesToAdd) {
+          if (Array.isArray(response)) {
+            combinedParts.push(...response);
+          } else if (typeof response === 'string') {
+            combinedParts.push({ text: response });
+          } else {
+            combinedParts.push(response);
           }
-          geminiClient.addHistory({
-            role: 'user',
-            parts: combinedParts,
-          });
         }
+        chatSession.addHistory({
+          role: 'user',
+          parts: combinedParts,
+        });
 
-        const callIdsToMarkAsSubmitted = geminiTools.map(
+        const callIdsToMarkAsSubmitted = chatTools.map(
           (toolCall) => toolCall.request.callId,
         );
         markToolsAsSubmitted(callIdsToMarkAsSubmitted);
         return;
       }
 
-      const responsesToSend: PartListUnion[] = geminiTools.map(
+      const responsesToSend: PartListUnion[] = chatTools.map(
         (toolCall) => toolCall.response.responseParts,
       );
-      const callIdsToMarkAsSubmitted = geminiTools.map(
+      const callIdsToMarkAsSubmitted = chatTools.map(
         (toolCall) => toolCall.request.callId,
       );
 
-      const prompt_ids = geminiTools.map(
+      const prompt_ids = chatTools.map(
         (toolCall) => toolCall.request.prompt_id,
       );
 
@@ -833,7 +972,7 @@ export const useGeminiStream = (
       isResponding,
       submitQuery,
       markToolsAsSubmitted,
-      geminiClient,
+      chatSession,
       performMemoryRefresh,
       modelSwitchedFromQuotaError,
     ],
@@ -844,6 +983,7 @@ export const useGeminiStream = (
     pendingToolCallGroupDisplay,
   ].filter((i) => i !== undefined && i !== null);
 
+  // Checkpoint restoration logic remains the same but uses chatSession instead of geminiClient
   useEffect(() => {
     const saveRestorableToolCalls = async () => {
       if (!config.getCheckpointingEnabled()) {
@@ -908,7 +1048,7 @@ export const useGeminiStream = (
             const toolName = toolCall.request.name;
             const fileName = path.basename(filePath);
             const toolCallWithSnapshotFileName = `${timestamp}-${fileName}-${toolName}.json`;
-            const clientHistory = await geminiClient?.getHistory();
+            const clientHistory = chatSession.getHistory();
             const toolCallWithSnapshotFilePath = path.join(
               checkpointDir,
               toolCallWithSnapshotFileName,
@@ -942,13 +1082,16 @@ export const useGeminiStream = (
       }
     };
     saveRestorableToolCalls();
-  }, [toolCalls, config, onDebugMessage, gitService, history, geminiClient]);
+  }, [toolCalls, config, onDebugMessage, gitService, history, chatSession]);
 
   return {
     streamingState,
+    streamState,
+    streamStatus,
     submitQuery,
     initError,
     pendingHistoryItems,
     thought,
+    eventBus, // Expose event bus for advanced usage
   };
 };

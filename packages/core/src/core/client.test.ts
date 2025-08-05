@@ -19,7 +19,7 @@ import { GeminiChat } from './geminiChat.js';
 import { Config } from '../config/config.js';
 import { GeminiEventType, Turn } from './turn.js';
 import { getCoreSystemPrompt } from './prompts.js';
-import { DEFAULT_GEMINI_FLASH_MODEL } from '../config/models.js';
+import { GEMINI_MODELS } from '../providers/gemini/GeminiConfig.js';
 import { FileDiscoveryService } from '../services/fileDiscoveryService.js';
 import { setSimulate429 } from '../utils/testUtils.js';
 import { tokenLimit } from './tokenLimits.js';
@@ -1277,7 +1277,7 @@ Here are some files the user has open, with the most recent at the top:
   describe('handleFlashFallback', () => {
     it('should use current model from config when checking for fallback', async () => {
       const initialModel = client['config'].getModel();
-      const fallbackModel = DEFAULT_GEMINI_FLASH_MODEL;
+      const fallbackModel = GEMINI_MODELS.FLASH;
 
       // mock config been changed
       const currentModel = initialModel + '-changed';

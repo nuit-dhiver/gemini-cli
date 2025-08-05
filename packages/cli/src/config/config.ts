@@ -16,8 +16,7 @@ import {
   setGeminiMdFilename as setServerGeminiMdFilename,
   getCurrentGeminiMdFilename,
   ApprovalMode,
-  DEFAULT_GEMINI_MODEL,
-  DEFAULT_GEMINI_EMBEDDING_MODEL,
+  GEMINI_MODELS,
   DEFAULT_MEMORY_FILE_FILTERING_OPTIONS,
   FileDiscoveryService,
   TelemetryTarget,
@@ -390,7 +389,7 @@ export async function loadCliConfig(
 
   return new Config({
     sessionId,
-    embeddingModel: DEFAULT_GEMINI_EMBEDDING_MODEL,
+    embeddingModel: GEMINI_MODELS.EMBEDDING,
     sandbox: sandboxConfig,
     targetDir: process.cwd(),
     includeDirectories: argv.includeDirectories,
@@ -441,7 +440,7 @@ export async function loadCliConfig(
     cwd: process.cwd(),
     fileDiscoveryService: fileService,
     bugCommand: settings.bugCommand,
-    model: argv.model || settings.model || DEFAULT_GEMINI_MODEL,
+    model: argv.model || settings.model || GEMINI_MODELS.DEFAULT,
     extensionContextFilePaths,
     maxSessionTurns: settings.maxSessionTurns ?? -1,
     experimentalAcp: argv.experimentalAcp || false,

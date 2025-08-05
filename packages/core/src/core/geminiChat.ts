@@ -31,7 +31,7 @@ import {
   ApiRequestEvent,
   ApiResponseEvent,
 } from '../telemetry/types.js';
-import { DEFAULT_GEMINI_FLASH_MODEL } from '../config/models.js';
+import { GEMINI_MODELS } from '../providers/gemini/GeminiConfig.js';
 
 /**
  * Returns true if the response is valid, false otherwise.
@@ -207,7 +207,7 @@ export class GeminiChat {
     }
 
     const currentModel = this.config.getModel();
-    const fallbackModel = DEFAULT_GEMINI_FLASH_MODEL;
+    const fallbackModel = GEMINI_MODELS.FLASH;
 
     // Don't fallback if already using Flash model
     if (currentModel === fallbackModel) {
@@ -275,12 +275,12 @@ export class GeminiChat {
 
     try {
       const apiCall = () => {
-        const modelToUse = this.config.getModel() || DEFAULT_GEMINI_FLASH_MODEL;
+        const modelToUse = this.config.getModel() || GEMINI_MODELS.FLASH;
 
         // Prevent Flash model calls immediately after quota error
         if (
           this.config.getQuotaErrorOccurred() &&
-          modelToUse === DEFAULT_GEMINI_FLASH_MODEL
+          modelToUse === GEMINI_MODELS.FLASH
         ) {
           throw new Error(
             'Please submit a new query to continue with the Flash model.',
@@ -390,7 +390,7 @@ export class GeminiChat {
         // Prevent Flash model calls immediately after quota error
         if (
           this.config.getQuotaErrorOccurred() &&
-          modelToUse === DEFAULT_GEMINI_FLASH_MODEL
+          modelToUse === GEMINI_MODELS.FLASH
         ) {
           throw new Error(
             'Please submit a new query to continue with the Flash model.',

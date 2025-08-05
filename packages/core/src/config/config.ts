@@ -45,10 +45,7 @@ import {
   TelemetryTarget,
   StartSessionEvent,
 } from '../telemetry/index.js';
-import {
-  DEFAULT_GEMINI_EMBEDDING_MODEL,
-  DEFAULT_GEMINI_FLASH_MODEL,
-} from './models.js';
+import { GEMINI_MODELS } from '../providers/gemini/GeminiConfig.js';
 import { ClearcutLogger } from '../telemetry/clearcut-logger/clearcut-logger.js';
 import { shouldAttemptBrowserLaunch } from '../utils/browser.js';
 import { MCPOAuthConfig } from '../mcp/oauth-provider.js';
@@ -263,7 +260,7 @@ export class Config extends EventEmitter {
     super();
     this.sessionId = params.sessionId;
     this.embeddingModel =
-      params.embeddingModel ?? DEFAULT_GEMINI_EMBEDDING_MODEL;
+      params.embeddingModel ?? GEMINI_MODELS.EMBEDDING;
     this.sandbox = params.sandbox;
     this.targetDir = path.resolve(params.targetDir);
     this.workspaceContext = new WorkspaceContext(
@@ -869,4 +866,4 @@ export class Config extends EventEmitter {
   }
 }
 // Export model constants for use in CLI
-export { DEFAULT_GEMINI_FLASH_MODEL };
+export { GEMINI_MODELS };

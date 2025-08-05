@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-export const DEFAULT_GEMINI_MODEL = 'gemini-2.5-pro';
-export const DEFAULT_GEMINI_FLASH_MODEL = 'gemini-2.5-flash';
-export const DEFAULT_GEMINI_FLASH_LITE_MODEL = 'gemini-2.5-flash-lite';
-
-export const DEFAULT_GEMINI_EMBEDDING_MODEL = 'gemini-embedding-001';
+// Provider-agnostic model configuration
+// Provider-specific models are now defined in their respective adapter modules
+// For example: packages/core/src/providers/gemini/GeminiConfig.ts
+// For backward compatibility, import from the appropriate provider config:
+// import { GEMINI_MODELS } from '../providers/gemini/GeminiConfig.js';
